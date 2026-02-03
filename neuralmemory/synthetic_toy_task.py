@@ -1,3 +1,5 @@
+import random
+
 import torch
 import torch.nn as nn
 
@@ -93,7 +95,13 @@ class Core(nn.Module):
             k = k.view(b, s, self.num_heads, self.key_dim)
             v = v.view(b, s, self.num_heads, self.value_dim)
 
+            # s = source, t = target
             qk = torch.einsum("bshd,bthd->bhst", q, k) / (self.key_dim**0.5)
+            causal_mask = torch.triu(
+                torch.ones((s, s), device=qk.device, dtype=torch.bool), diagonal=1
+            )
+            qk = qk.masked_fill(causal_mask, float("-inf"))
+
             v_context = torch.einsum(
                 "bhst,bthv->bshv", torch.softmax(qk, dim=-1), v
             ).reshape(b, s, -1)
@@ -131,8 +139,33 @@ def make_banks(core: Core, num_knowledge_entries: int) -> nn.ModuleList:
     )
 
 
-tokens = ["bob", "is", "tall", "short"]
-token_map = {k: i for i, k in enumerate(tokens)}
+token_vocabulary = [
+    "<end>",
+    "bob",
+    "is",
+    "tall",
+    "short",
+    "happy",
+    "sad",
+    "gary",
+]
+token_map = {k: i for i, k in enumerate(token_vocabulary)}
+
+
+@torch.no_grad()
+def generate(model: Model, prompt: list[str], bank_group: str, max_length: int):
+    # No optimizations or caching; just for testing.
+    tokens = torch.zeros((1, max_length), dtype=torch.long)
+    for i, t in enumerate(prompt):
+        tokens[0, i] = token_map[t]
+
+    for i in range(len(prompt), max_length):
+        logits = model(tokens[:, :i], bank_group=bank_group)
+        next_token = logits.argmax(dim=-1)[:, -1]
+        tokens[0, i] = next_token
+        yield token_vocabulary[next_token.item()]
+        if next_token.item() == token_map["<end>"]:
+            break
 
 
 def main():
@@ -155,33 +188,52 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
 
-    tokens_by_group = {
-        "group1": ["bob", "is", "tall"],
-        "group2": ["bob", "is", "short"],
+    datasets_by_group = {
+        "group1": [["bob", "is", "tall"], ["gary", "is", "happy"]],
+        "group2": [["bob", "is", "short"], ["gary", "is", "sad"]],
     }
 
     # Dummy training loop
     for step in range(100):
         for bank_group in ["group1", "group2"]:
-            input_tokens = torch.tensor(
-                [[token_map[t] for t in tokens_by_group[bank_group]]]
+            sequence_tokens = torch.tensor(
+                [
+                    [token_map[t] for t in random.choice(datasets_by_group[bank_group])]
+                    + [token_map["<end>"]]
+                ]
             )
-            logits = model(input_tokens, bank_group=bank_group)
-            max_logits = logits.argmax(dim=-1)
-            output_tokens = [
-                [tokens[index.item()] for index in max_logits[b]]
-                for b in range(input_tokens.size(0))
-            ]
-            loss = loss_fn(logits.view(-1, logits.size(-1)), input_tokens.view(-1))
-
-            print(bank_group, repr(" ".join(output_tokens[0])))
+            logits = model(sequence_tokens[:, :-1], bank_group=bank_group)
+            loss = loss_fn(
+                logits.view(-1, logits.size(-1)), sequence_tokens[:, 1:].view(-1)
+            )
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            """
+            max_logits = logits.argmax(dim=-1)
+            output_tokens = [
+                [token_vocabulary[index.item()] for index in max_logits[b]]
+                for b in range(sequence_tokens.size(0))
+            ]
+            print(bank_group, repr(" ".join(output_tokens[0])))
+            """
+
         if step % 10 == 0:
             print(f"Step {step}, Loss: {loss.item()}")
+
+    prompt = ["bob", "is"]
+    for bank_group in ["group1", "group2"]:
+        print("Generation for", prompt, "with bank group", bank_group + ":")
+        for token in generate(model, prompt, bank_group=bank_group, max_length=10):
+            print(token)
+
+    prompt = ["gary", "is"]
+    for bank_group in ["group1", "group2"]:
+        print("Generation for", prompt, "with bank group", bank_group + ":")
+        for token in generate(model, prompt, bank_group=bank_group, max_length=10):
+            print(token)
 
 
 if __name__ == "__main__":
