@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-class Knowledge(nn.Module):
+class Bank(nn.Module):
     def __init__(
         self,
         num_heads: int,
@@ -35,20 +35,15 @@ class Knowledge(nn.Module):
         b, h, k = queries.shape
         scores = self.compute_scores_dense(queries)
         values = torch.einsum("bhk,hkv->bhv", scores, self.values) / self.key_dim**0.5
-        return self.value_unprojection(values.view(b, -1))
+        return self.value_unprojection(values.reshape(b, -1))
 
 
 class Core(nn.Module):
-    pass
-
-
-class NeuralMemoryMachine(nn.Module):
     def __init__(
         self,
         embed_dim: int,
         value_dim: int,
         num_heads: int,
-        num_knowledge_entries: int,
         num_layers: int,
         num_vocab: int,
     ):
@@ -63,14 +58,7 @@ class NeuralMemoryMachine(nn.Module):
         self.num_layers = num_layers
 
         self.input_embedder = nn.Embedding(num_vocab, embed_dim)
-        self.knowledge_modules = nn.ModuleList(
-            [
-                Knowledge(
-                    num_heads, num_knowledge_entries, self.key_dim, value_dim, embed_dim
-                )
-                for _ in range(num_layers)
-            ]
-        )
+
         # queries are for both knowledge and token retrieval.
         # keys and values are for token retrieval.
         self.qkv = nn.ModuleList(
@@ -83,7 +71,11 @@ class NeuralMemoryMachine(nn.Module):
         )
         self.value_unprojection = nn.Linear(num_heads * value_dim, embed_dim)
 
-    def forward(self, input_tokens: torch.Tensor):
+    def forward(
+        self,
+        input_tokens: torch.Tensor,
+        banks: nn.ModuleList | list[nn.Module],
+    ):
         b, s = input_tokens.shape
 
         x = self.input_embedder(input_tokens)
@@ -104,25 +96,93 @@ class NeuralMemoryMachine(nn.Module):
             qk = torch.einsum("bshd,bthd->bhst", q, k) / (self.key_dim**0.5)
             v_context = torch.einsum(
                 "bhst,bthv->bshv", torch.softmax(qk, dim=-1), v
-            ).view(b, s, -1)
+            ).reshape(b, s, -1)
+            context_data = self.value_unprojection(v_context)
+            bank_data = banks[i](q.view(-1, self.num_heads, self.key_dim))
 
-            x = x + self.knowledge_modules[i](q) + self.value_unprojection(v_context)
+            x = x + context_data + bank_data
 
         return torch.einsum("bsd,wd->bsw", x, self.input_embedder.weight)
 
 
-token_map = {
-    "bob": 0,
-    "is": 1,
-    "tall": 2,
-    "short": 3,
-}
+class Model(nn.Module):
+    def __init__(self, core: Core, banks: nn.ModuleDict):
+        super().__init__()
 
-nmm = NeuralMemoryMachine(
-    embed_dim=32,
-    value_dim=16,
-    num_heads=4,
-    num_knowledge_entries=8,
-    num_layers=2,
-    num_vocab=len(token_map),
-)
+        self.core = core
+        self.banks = banks
+
+    def forward(self, input_tokens: torch.Tensor, bank_group: str):
+        return self.core(input_tokens, self.banks[bank_group])
+
+
+def make_banks(core: Core, num_knowledge_entries: int) -> nn.ModuleList:
+    return nn.ModuleList(
+        [
+            Bank(
+                core.num_heads,
+                num_knowledge_entries,
+                core.key_dim,
+                core.value_dim,
+                core.embed_dim,
+            )
+            for _ in range(core.num_layers)
+        ]
+    )
+
+
+tokens = ["bob", "is", "tall", "short"]
+token_map = {k: i for i, k in enumerate(tokens)}
+
+
+def main():
+    core = Core(
+        embed_dim=32,
+        value_dim=16,
+        num_heads=4,
+        num_layers=2,
+        num_vocab=len(token_map),
+    )
+    banks = nn.ModuleDict(
+        {
+            # Two 'groups', for testing purposes. (this abstraction may not hold in the long run; just for experimentation).
+            "group1": make_banks(core, num_knowledge_entries=8),
+            "group2": make_banks(core, num_knowledge_entries=8),
+        }
+    )
+
+    model = Model(core=core, banks=banks)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+
+    tokens_by_group = {
+        "group1": ["bob", "is", "tall"],
+        "group2": ["bob", "is", "short"],
+    }
+
+    # Dummy training loop
+    for step in range(100):
+        for bank_group in ["group1", "group2"]:
+            input_tokens = torch.tensor(
+                [[token_map[t] for t in tokens_by_group[bank_group]]]
+            )
+            logits = model(input_tokens, bank_group=bank_group)
+            max_logits = logits.argmax(dim=-1)
+            output_tokens = [
+                [tokens[index.item()] for index in max_logits[b]]
+                for b in range(input_tokens.size(0))
+            ]
+            loss = loss_fn(logits.view(-1, logits.size(-1)), input_tokens.view(-1))
+
+            print(bank_group, repr(" ".join(output_tokens[0])))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        if step % 10 == 0:
+            print(f"Step {step}, Loss: {loss.item()}")
+
+
+if __name__ == "__main__":
+    main()
