@@ -797,6 +797,30 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
+class MemoryBank(nn.Module):
+    """Global memory bank accessible from all attention layers."""
+    def __init__(self, num_heads: int, num_entries: int, key_dim: int, value_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_entries = num_entries
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+
+        self.keys = nn.Parameter(torch.zeros(num_heads, num_entries, key_dim))
+        self.values = nn.Parameter(torch.zeros(num_heads, num_entries, value_dim))
+        self.keys.label = 'memory_bank_keys'
+        self.values.label = 'memory_bank_values'
+
+    def forward(self, queries: torch.Tensor) -> torch.Tensor:
+        # queries: (B, T, num_heads, key_dim)
+        # keys: (num_heads, num_entries, key_dim)
+        # values: (num_heads, num_entries, value_dim)
+        scores = torch.einsum("bthd,hkd->bthk", queries, self.keys)
+        scores = torch.sigmoid(scores)
+        values = torch.einsum("bthk,hkv->bthv", scores, self.values) / (self.key_dim ** 0.5)
+        return values
+
+
 class CastedLinearT(nn.Module):
     """
     Linear layer with transposed weight storage (in_features, out_features) which
@@ -908,6 +932,7 @@ class AttnArgs:
     key_offset: bool
     attn_gate_w: torch.Tensor
     ve_gate_w: torch.Tensor
+    memory_bank: MemoryBank | None = None
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
@@ -938,6 +963,7 @@ class CausalSelfAttention(nn.Module):
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q_for_bank = q  # Save normalized queries for memory bank lookup
 
         if not self.paired:
             q, k = yarn.rotary(q), yarn.rotary(k)
@@ -977,6 +1003,10 @@ class CausalSelfAttention(nn.Module):
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        # Memory bank retrieval
+        if attn_args.memory_bank is not None:
+            bank_context = attn_args.memory_bank(q_for_bank)  # (B, T, num_heads, head_dim)
+            y = y + bank_context
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
@@ -1038,6 +1068,14 @@ class GPT(nn.Module):
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.Parameter(torch.zeros(5 * self.vocab_size, model_dim, dtype=torch.bfloat16))
         self.value_embeds.label = 'value_embed'
+
+        # Memory bank for knowledge retrieval
+        self.memory_bank = MemoryBank(
+            num_heads=num_heads,
+            num_entries=args.memory_bank_entries,
+            key_dim=head_dim,
+            value_dim=head_dim
+        )
 
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
@@ -1202,7 +1240,8 @@ class GPT(nn.Module):
                 yarn=yarn,
                 key_offset=key_offset[i],
                 attn_gate_w=attn_gates[i],
-                ve_gate_w=ve_gates[i]
+                ve_gate_w=ve_gates[i],
+                memory_bank=self.memory_bank
             )
             if i in skip_out:
                 skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
@@ -1438,6 +1477,8 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # memory bank
+    memory_bank_entries: int = 256  # number of entries in memory bank
 
 args = Hyperparameters()
 
@@ -1561,6 +1602,8 @@ class TrainingManager():
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "ve_gate_bank":   {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
             "x0_lambdas":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.65, 0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
+            "memory_bank_keys":   {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 1.0, "wd_mul": 0.0},
+            "memory_bank_values": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.95], "lr_mul": 1.0, "wd_mul": 0.0},
             "lm_head":        {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
@@ -1569,6 +1612,7 @@ class TrainingManager():
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
+            "memory_bank_keys", "memory_bank_values",  # Memory bank - small replicated params
             "value_embed", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
@@ -1715,6 +1759,8 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.memory_bank.keys.data = model.memory_bank.keys.data.bfloat16()
+model.memory_bank.values.data = model.memory_bank.values.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
