@@ -26,18 +26,17 @@ class Bank(nn.Module):
         self.values = nn.Parameter(
             torch.zeros((num_heads, num_knowledge_entries, value_dim))
         )
-        self.value_unprojection = nn.Linear(num_heads * value_dim, output_dim)
 
     def compute_scores_dense(self, queries: torch.Tensor):
-        scores = torch.einsum("hkd,bhc->bhk", self.keys, queries)
+        scores = torch.einsum("hkd,bshd->bshk", self.keys, queries)
         scores = torch.sigmoid(scores)
         return scores
 
     def forward(self, queries: torch.Tensor):
-        b, h, k = queries.shape
+        b, s, h, k = queries.shape
         scores = self.compute_scores_dense(queries)
-        values = torch.einsum("bhk,hkv->bhv", scores, self.values) / self.key_dim**0.5
-        return self.value_unprojection(values.reshape(b, -1))
+        values = torch.einsum("bshk,hkv->bshv", scores, self.values) / self.key_dim**0.5
+        return values
 
 
 class Core(nn.Module):
@@ -105,10 +104,9 @@ class Core(nn.Module):
             v_context = torch.einsum(
                 "bhst,bthv->bshv", torch.softmax(qk, dim=-1), v
             ).reshape(b, s, -1)
-            context_data = self.value_unprojection(v_context)
-            bank_data = banks[i](q.view(-1, self.num_heads, self.key_dim))
-
-            x = x + context_data + bank_data
+            bank_context = banks[i](q).reshape(b, s, -1)
+            context_data = self.value_unprojection(v_context + bank_context)
+            x = x + context_data
 
         return torch.einsum("bsd,wd->bsw", x, self.input_embedder.weight)
 
