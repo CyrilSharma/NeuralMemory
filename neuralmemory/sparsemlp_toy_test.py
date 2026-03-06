@@ -51,6 +51,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
         outputs = model(data)
         loss = criterion(outputs, targets)
 
+        t0 = time.time()
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
@@ -58,7 +59,13 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
         # Gradient clipping to prevent explosion
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
+        t1 = time.time()
+
         optimizer.step()
+
+        t2 = time.time()
+
+        print(t1 - t0, t2 - t1)
 
         # Statistics
         total_loss += loss.item()
