@@ -33,12 +33,13 @@ class SparseMLP(nn.Module):
         idxs_B_S_O = idxs_B_S.unsqueeze(-1).expand(-1, -1, self.output_dim)
         corrections_B = p_sum_B / self.sparsity_dim
         corrections_B_1 = corrections_B.view(-1, 1)
-
+        p_B_S = p_B_H.gather(dim=1, index=idxs_B_S)
+        # straight-through estimator
+        corrections_B_H = p_B_S / p_B_S.detach() * corrections_B_1
         out_weight_B_H_O: torch.Tensor = self.out_weight.view(
             1, self.hidden_dim, self.output_dim
         ).expand(b, 1, 1)
-
         out_B_O = torch.gather(out_weight_B_H_O, dim=1, index=idxs_B_S_O).sum(dim=1)
-        out_B_O = out_B_O * corrections_B_1
+        out_B_O = out_B_O * corrections_B_H
         out = out_B_O.view(*shape0, self.output_dim)
         return out
