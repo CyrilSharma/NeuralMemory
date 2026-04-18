@@ -78,7 +78,7 @@ class AsynchronousLookupTable(Function):
             * retrieval_coefficient_grad_B_S_R.unsqueeze(-1)
         ).sum(dim=-2)
 
-        # Key and value gradients are dictionaries. Query gradients are passed back to the input residual stream and will be handled by autograd as usual.
+        # Key and value gradients are dictionaries. Query gradients are passed back to the input residual stream and will be handled by autograd as usual. It would be p nice to be able to do process-in-memory (PIM) updates here.
         key_grad_E_D = torch.zeros_like(keys_E_D)
         value_grad_E_D = torch.zeros_like(values_E_D)
         key_grad_E_D[top_k_indices_B_S_R] = key_grad_R_D
@@ -88,74 +88,74 @@ class AsynchronousLookupTable(Function):
         return query_grad_B_S_D, key_grad_E_D, value_grad_E_D
 
 
-# Assume D = 10, E = 10
-keys_E_D = torch.eye(10, requires_grad=True)
-values_E_D = torch.eye(10, requires_grad=True)
-queries_B_S_D = torch.zeros(2, 3, 10)  # B = 2, S = 3, D = 10
-queries_B_S_D[0, 0, 0] = 1.0
-queries_B_S_D[0, 0, 1] = 1.0
+def test():
+    # Assume D = 10, E = 10
+    keys_E_D = torch.eye(10, requires_grad=True)
+    values_E_D = torch.eye(10, requires_grad=True)
+    queries_B_S_D = torch.zeros(2, 3, 10)  # B = 2, S = 3, D = 10
+    queries_B_S_D[0, 0, 0] = 1.0
+    queries_B_S_D[0, 0, 1] = 1.0
 
-output = AsynchronousLookupTable.apply(queries_B_S_D, keys_E_D, values_E_D)
-output.sum().backward()
+    output = AsynchronousLookupTable.apply(queries_B_S_D, keys_E_D, values_E_D)
+    output.sum().backward()
 
-# print("queries_B_S_D.grad")
-# print(queries_B_S_D.grad)
-# print("keys_E_D.grad")
-# print(keys_E_D.grad)
-# print("values_E_D.grad")
-# print(values_E_D.grad)
+    # print("queries_B_S_D.grad")
+    # print(queries_B_S_D.grad)
+    # print("keys_E_D.grad")
+    # print(keys_E_D.grad)
+    # print("values_E_D.grad")
+    # print(values_E_D.grad)
 
-keys_E_D = torch.randn((10, 10), requires_grad=True)
-values_E_D = torch.randn((10, 10), requires_grad=True)
-queries_B_S_D = torch.randn((2, 3, 10), requires_grad=True)
-output = AsynchronousLookupTable.apply(queries_B_S_D, keys_E_D, values_E_D)
-output.sum().backward()
+    keys_E_D = torch.randn((10, 10), requires_grad=True)
+    values_E_D = torch.randn((10, 10), requires_grad=True)
+    queries_B_S_D = torch.randn((2, 3, 10), requires_grad=True)
+    output = AsynchronousLookupTable.apply(queries_B_S_D, keys_E_D, values_E_D)
+    output.sum().backward()
 
-with_fn_query_grad = queries_B_S_D.grad.clone()
-with_fn_key_grad = keys_E_D.grad.clone()
-with_fn_value_grad = values_E_D.grad.clone()
+    with_fn_query_grad = queries_B_S_D.grad.clone()
+    with_fn_key_grad = keys_E_D.grad.clone()
+    with_fn_value_grad = values_E_D.grad.clone()
 
-# print("q")
-# print(with_fn_query_grad)
-# print("k")
-# print(with_fn_key_grad)
-# print("v")
-# print(with_fn_value_grad)
+    # print("q")
+    # print(with_fn_query_grad)
+    # print("k")
+    # print(with_fn_key_grad)
+    # print("v")
+    # print(with_fn_value_grad)
 
-# print("---")
+    # print("---")
 
-# Compute the true grad. Clear old grad
-queries_B_S_D.grad = None
-keys_E_D.grad = None
-values_E_D.grad = None
+    # Compute the true grad. Clear old grad
+    queries_B_S_D.grad = None
+    keys_E_D.grad = None
+    values_E_D.grad = None
 
-# (B, S, E, 1) @ (E, D) -> (B, S, E, D) -> (B, S, D)
-retrieval_coefficients = queries_B_S_D @ keys_E_D.t()
-retrieval_coefficients.retain_grad()
-# print("retrieval coefficients")
-# print(retrieval_coefficients)
+    # (B, S, E, 1) @ (E, D) -> (B, S, E, D) -> (B, S, D)
+    retrieval_coefficients = queries_B_S_D @ keys_E_D.t()
+    retrieval_coefficients.retain_grad()
+    # print("retrieval coefficients")
+    # print(retrieval_coefficients)
 
-# only take first 2 indices as actual retrievals
-retrieval_coefficients[:, :, 2:] = 0.0
+    # only take first 2 indices as actual retrievals
+    retrieval_coefficients[:, :, 2:] = 0.0
 
-true_output_B_S_D = (retrieval_coefficients.unsqueeze(-1) * values_E_D).sum(dim=-2)
-true_output_B_S_D.sum().backward()
+    true_output_B_S_D = (retrieval_coefficients.unsqueeze(-1) * values_E_D).sum(dim=-2)
+    true_output_B_S_D.sum().backward()
 
-gt_query_grad = queries_B_S_D.grad.clone()
-gt_key_grad = keys_E_D.grad.clone()
-gt_value_grad = values_E_D.grad.clone()
+    gt_query_grad = queries_B_S_D.grad.clone()
+    gt_key_grad = keys_E_D.grad.clone()
+    gt_value_grad = values_E_D.grad.clone()
 
-# print("retrieval_coefficients_grad")
-# print(retrieval_coefficients.grad)
+    # print("retrieval_coefficients_grad")
+    # print(retrieval_coefficients.grad)
 
-# print("q")
-# print(gt_query_grad)
-# print("k")
-# print(gt_key_grad)
-# print("v")
-# print(gt_value_grad)
+    # print("q")
+    # print(gt_query_grad)
+    # print("k")
+    # print(gt_key_grad)
+    # print("v")
+    # print(gt_value_grad)
 
-
-assert torch.allclose(with_fn_query_grad, gt_query_grad)
-assert torch.allclose(with_fn_key_grad, gt_key_grad)
-assert torch.allclose(with_fn_value_grad, gt_value_grad)
+    assert torch.allclose(with_fn_query_grad, gt_query_grad)
+    assert torch.allclose(with_fn_key_grad, gt_key_grad)
+    assert torch.allclose(with_fn_value_grad, gt_value_grad)
