@@ -3,10 +3,6 @@ What we need:
 - An asynchronous "lookup" function that takes in the current residual stream for a token and then calls a potentially expensive lookup process on a sparse memory table
 - Ways to propagate information back to this lookup table
 
-We use a maximum inner product search, where we simply take the top K entries in the memory table that have the highest inner product with the current residual stream. We
-then specify `requires_grad` and `retain_grad` for that tensor. During backpropagation, the `grad_fn` can have properties beginning with `_saved` to represent the saved
-tensors from the forward pass.
-
 """
 
 import torch
@@ -27,6 +23,9 @@ class AsynchronousLookupTable(Function):
         )  # Placeholder for top K indices
 
         top_k_coefficients_B_S_R = queries_B_S_D @ keys_E_D.t()
+
+        # print("retrieval coefficients [in func]")
+        # print(top_k_coefficients_B_S_R)
 
         ctx.save_for_backward(
             top_k_indices_B_S_R,
@@ -62,8 +61,10 @@ class AsynchronousLookupTable(Function):
 
         # Gradient for retrieval coefficients is output gradient dotted with value vector for that coefficient
         retrieval_coefficient_grad_B_S_R = (
-            values_E_D[top_k_indices_B_S_R] * grad_elementwise_B_S_R_D
+            values_E_D[top_k_indices_B_S_R] * grad_output_B_S_D.unsqueeze(-2)
         ).sum(dim=-1)
+
+        # print(retrieval_coefficient_grad_B_S_R)
 
         # Gradient for keys is query vector scaled by retrieval coefficient gradient
         key_grad_R_D = (
@@ -91,10 +92,62 @@ queries_B_S_D[0, 0, 1] = 1.0
 output = AsynchronousLookupTable.apply(queries_B_S_D, keys_E_D, values_E_D)
 output.sum().backward()
 
-print(queries_B_S_D)
-print("===")
-print(output)
-print("keys_E_D.grad")
-print(keys_E_D.grad)
-print("values_E_D.grad")
-print(values_E_D.grad)
+# print("queries_B_S_D.grad")
+# print(queries_B_S_D.grad)
+# print("keys_E_D.grad")
+# print(keys_E_D.grad)
+# print("values_E_D.grad")
+# print(values_E_D.grad)
+
+keys_E_D = torch.randn((10, 10), requires_grad=True)
+values_E_D = torch.randn((10, 10), requires_grad=True)
+queries_B_S_D = torch.randn((2, 3, 10), requires_grad=True)
+output = AsynchronousLookupTable.apply(queries_B_S_D, keys_E_D, values_E_D)
+output.sum().backward()
+
+with_fn_query_grad = queries_B_S_D.grad.clone()
+with_fn_key_grad = keys_E_D.grad.clone()
+with_fn_value_grad = values_E_D.grad.clone()
+
+# print("q")
+# print(with_fn_query_grad)
+# print("k")
+# print(with_fn_key_grad)
+# print("v")
+# print(with_fn_value_grad)
+
+# print("---")
+
+# Compute the true grad. Clear old grad
+queries_B_S_D.grad = None
+keys_E_D.grad = None
+values_E_D.grad = None
+
+# (B, S, E, 1) @ (E, D) -> (B, S, E, D) -> (B, S, D)
+retrieval_coefficients = queries_B_S_D @ keys_E_D.t()
+retrieval_coefficients.retain_grad()
+# print("retrieval coefficients")
+# print(retrieval_coefficients)
+
+
+true_output_B_S_D = (retrieval_coefficients.unsqueeze(-1) * values_E_D).sum(dim=-2)
+true_output_B_S_D.sum().backward()
+
+gt_query_grad = queries_B_S_D.grad.clone()
+gt_key_grad = keys_E_D.grad.clone()
+gt_value_grad = values_E_D.grad.clone()
+
+# print("retrieval_coefficients_grad")
+# print(retrieval_coefficients.grad)
+
+# print("q")
+# print(gt_query_grad)
+# print("k")
+# print(gt_key_grad)
+# print("v")
+# print(gt_value_grad)
+
+
+assert torch.allclose(with_fn_query_grad, gt_query_grad)
+assert torch.allclose(with_fn_key_grad, gt_key_grad)
+assert torch.allclose(with_fn_value_grad, gt_value_grad)
