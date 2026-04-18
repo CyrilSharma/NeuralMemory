@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.nn.utils import skip_init
 
 index_params = cagra.IndexParams(metric="inner_product")
-search_params = cagra.SearchParams()
+search_params = cagra.SearchParams(algo="single_cta", itopk_size=512)
 
 
 class SparseMLP(nn.Module):
@@ -126,6 +126,11 @@ class SparseGatedMLP(nn.Module):
         indices_B_R = torch.as_tensor(
             indices_B_R, device=x_B_D.device, dtype=torch.long
         )
+        # indices_B_R = (
+        #     torch.arange(self.hidden_dim, device=x_B_D.device)
+        #     .unsqueeze(0)
+        #     .expand(x_B_D.shape[0], -1)
+        # )
 
         # Recompute distances
         retrieved_keys_B_R_D = self.in_weight.weight[indices_B_R]

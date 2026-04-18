@@ -16,17 +16,18 @@ model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto").to("cuda")
 
 # Replace MLPs with SparseMLP
 # Config: https://huggingface.co/google/gemma-4-31B/blob/main/config.json
-#
+#     and https://huggingface.co/google/gemma-4-E4B-it/blob/main/config.json
 HIDDEN_DIM = model.config.text_config.intermediate_size
 RESIDUAL_STREAM_DIM = model.config.text_config.hidden_size
-SPARSITY_DIM = 32
+SPARSITY_DIM = 512
 
 lm = model.model.language_model
 
 print("Found", len(lm.layers), "layers")
 
-# sparse_layers = list(range(16, 18))
-sparse_layers = []
+sparse_layers = list(range(16, 32))
+# sparse_layers = list(range(len(lm.layers)))
+# sparse_layers = []
 
 for i in range(len(lm.layers)):
     if i not in sparse_layers:
