@@ -16,13 +16,13 @@ class AsynchronousLookupTable(Function):
         # Notation: E = # kv entries, R = retrievals, B = batch size, S = sequence length, D = dimension of residual stream and kv entries
         num_kv_entries = keys_E_D.shape[0]
         top_k_indices_B_S_R = (
-            torch.arange(num_kv_entries)
+            torch.arange(2)
             .unsqueeze(0)
             .unsqueeze(0)
-            .expand(queries_B_S_D.shape[0], queries_B_S_D.shape[1], num_kv_entries)
+            .expand(queries_B_S_D.shape[0], queries_B_S_D.shape[1], -1)
         )  # Placeholder for top K indices
 
-        top_k_coefficients_B_S_R = queries_B_S_D @ keys_E_D.t()
+        top_k_coefficients_B_S_R = (queries_B_S_D @ keys_E_D.t())[:, :, :2]
 
         # print("retrieval coefficients [in func]")
         # print(top_k_coefficients_B_S_R)
@@ -79,7 +79,13 @@ class AsynchronousLookupTable(Function):
         ).sum(dim=-2)
 
         # Key and value gradients are dictionaries. Query gradients are passed back to the input residual stream and will be handled by autograd as usual.
-        return query_grad_B_S_D, key_grad_R_D, value_grad_R_D
+        key_grad_E_D = torch.zeros_like(keys_E_D)
+        value_grad_E_D = torch.zeros_like(values_E_D)
+        key_grad_E_D[top_k_indices_B_S_R] = key_grad_R_D
+        value_grad_E_D[top_k_indices_B_S_R] = value_grad_R_D
+
+        # return query_grad_B_S_D, key_grad_R_D, value_grad_R_D
+        return query_grad_B_S_D, key_grad_E_D, value_grad_E_D
 
 
 # Assume D = 10, E = 10
@@ -129,6 +135,8 @@ retrieval_coefficients.retain_grad()
 # print("retrieval coefficients")
 # print(retrieval_coefficients)
 
+# only take first 2 indices as actual retrievals
+retrieval_coefficients[:, :, 2:] = 0.0
 
 true_output_B_S_D = (retrieval_coefficients.unsqueeze(-1) * values_E_D).sum(dim=-2)
 true_output_B_S_D.sum().backward()
