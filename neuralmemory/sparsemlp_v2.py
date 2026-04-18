@@ -106,16 +106,20 @@ class SparseGatedMLP(nn.Module):
 
     def rebuild_index(self):
         # cp.asarray is zero-copy. what happens during gradient updates if we don't rebuild the index? hopefully cuvs doesn't really care because I don't
-        self.index = cagra.build(index_params, cp.asarray(self.in_weight.weight.data))
+        self.index = cagra.build(
+            index_params, cp.asarray(self.in_weight.weight.data.float())
+        )
 
-    def forward(self, x_B_D: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_b_D: torch.Tensor) -> torch.Tensor:
         assert self.index is not None, "Index must be built before forward pass"
+
+        x_B_D = x_b_D.view(-1, x_b_D.shape[-1])
 
         t0 = time.time()  # noqa: F841
         # cp.asarray is zero-copy
         # https://docs.cupy.dev/en/stable/user_guide/interoperability.html#pytorch
         _, indices_B_R = cagra.search(
-            search_params, self.index, cp.asarray(x_B_D), k=self.sparsity_dim
+            search_params, self.index, cp.asarray(x_B_D.float()), k=self.sparsity_dim
         )
         t1 = time.time()  # noqa: F841
 
@@ -129,13 +133,15 @@ class SparseGatedMLP(nn.Module):
 
         # Compute retrieval coefficients
         retrieval_coefficients_B_R = torch.bmm(
-            x_B_D.unsqueeze(1), retrieved_keys_B_R_D.transpose(1, 2)
+            x_B_D.unsqueeze(1),
+            retrieved_keys_B_R_D.transpose(1, 2).to(dtype=x_b_D.dtype),
         ).squeeze(1)
 
         # Multiply by gate values
         retrieved_gate_keys_B_R_D = self.gate_weight.weight[indices_B_R]
         gate_values = torch.bmm(
-            x_B_D.unsqueeze(1), retrieved_gate_keys_B_R_D.transpose(1, 2)
+            x_B_D.unsqueeze(1),
+            retrieved_gate_keys_B_R_D.transpose(1, 2).to(dtype=x_b_D.dtype),
         ).squeeze(1)
         retrieval_coefficients_B_R = retrieval_coefficients_B_R * F.gelu(
             gate_values, approximate="tanh"
@@ -143,8 +149,9 @@ class SparseGatedMLP(nn.Module):
         retrievals_B_D = torch.einsum(
             "br,brd->bd", retrieval_coefficients_B_R, retrieved_values_B_R_D
         )
+        retrievals_b_D = retrievals_B_D.view(*x_b_D.shape)
 
-        return retrievals_B_D
+        return retrievals_b_D
 
 
 if __name__ == "__main__":
