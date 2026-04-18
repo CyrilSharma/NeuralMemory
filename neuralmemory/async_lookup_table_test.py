@@ -11,33 +11,28 @@ from torch.autograd import Function
 
 class AsynchronousLookupTable(Function):
     @staticmethod
-    def forward(ctx, queries_B_S_D, keys_E_D, values_E_D):
+    def forward(ctx, queries_B_S_D, lookup_table):
         # Assume for now that all indices are selected with coefficients according to dot product.
         # Notation: E = # kv entries, R = retrievals, B = batch size, S = sequence length, D = dimension of residual stream and kv entries
-        num_kv_entries = keys_E_D.shape[0]
-        top_k_indices_B_S_R = (
-            torch.arange(2)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .expand(queries_B_S_D.shape[0], queries_B_S_D.shape[1], -1)
-        )  # Placeholder for top K indices
 
-        top_k_coefficients_B_S_R = (queries_B_S_D @ keys_E_D.t())[:, :, :2]
-
-        # print("retrieval coefficients [in func]")
-        # print(top_k_coefficients_B_S_R)
+        (
+            top_k_indices_B_S_R,
+            top_k_coefficients_B_S_R,
+            top_k_keys_B_S_R_D,
+            top_k_values_B_S_R_D,
+        ) = lookup_table(queries_B_S_D)
 
         ctx.save_for_backward(
             top_k_indices_B_S_R,
             top_k_coefficients_B_S_R,
             queries_B_S_D,
-            keys_E_D,
-            values_E_D,
+            top_k_keys_B_S_R_D,
+            top_k_values_B_S_R_D,
         )
 
         # (B, S, R, D) * (R, D) -> (B, S, R, D) -> (B, S, D)
         aggregated_values_B_S_D = (
-            top_k_coefficients_B_S_R.unsqueeze(-1) * values_E_D[top_k_indices_B_S_R]
+            top_k_coefficients_B_S_R.unsqueeze(-1) * top_k_values_B_S_R_D
         ).sum(dim=-2)
 
         return aggregated_values_B_S_D
@@ -48,44 +43,37 @@ class AsynchronousLookupTable(Function):
             top_k_indices_B_S_R,
             top_k_coefficients_B_S_R,
             queries_B_S_D,
-            keys_E_D,
-            values_E_D,
+            top_k_keys_B_S_R_D,
+            top_k_values_B_S_R_D,
         ) = ctx.saved_tensors
 
-        grad_elementwise_B_S_R_D = grad_output_B_S_D.unsqueeze(
+        # Gradient for values is output gradient scaled by retrieval coefficient for that value
+        value_grad_B_S_R_D = grad_output_B_S_D.unsqueeze(
             -2
         ) * top_k_coefficients_B_S_R.unsqueeze(-1)
 
-        # Gradient for values is output gradient scaled by retrieval coefficient for that value
-        value_grad_R_D = grad_elementwise_B_S_R_D.sum(dim=(0, 1))
-
         # Gradient for retrieval coefficients is output gradient dotted with value vector for that coefficient
         retrieval_coefficient_grad_B_S_R = (
-            values_E_D[top_k_indices_B_S_R] * grad_output_B_S_D.unsqueeze(-2)
+            top_k_values_B_S_R_D * grad_output_B_S_D.unsqueeze(-2)
         ).sum(dim=-1)
 
         # print(retrieval_coefficient_grad_B_S_R)
 
         # Gradient for keys is query vector scaled by retrieval coefficient gradient
-        key_grad_R_D = (
-            queries_B_S_D.unsqueeze(-2) * retrieval_coefficient_grad_B_S_R.unsqueeze(-1)
-        ).sum(dim=(0, 1))
+        key_grad_B_S_R_D = queries_B_S_D.unsqueeze(
+            -2
+        ) * retrieval_coefficient_grad_B_S_R.unsqueeze(-1)
 
         # Gradient for queries is key vector scaled by retrieval coefficient gradient
         # This is the gradient that will be backpropagated to the input residual stream
         query_grad_B_S_D = (
-            keys_E_D[top_k_indices_B_S_R]
-            * retrieval_coefficient_grad_B_S_R.unsqueeze(-1)
+            top_k_keys_B_S_R_D * retrieval_coefficient_grad_B_S_R.unsqueeze(-1)
         ).sum(dim=-2)
 
-        # Key and value gradients are dictionaries. Query gradients are passed back to the input residual stream and will be handled by autograd as usual. It would be p nice to be able to do process-in-memory (PIM) updates here.
-        key_grad_E_D = torch.zeros_like(keys_E_D)
-        value_grad_E_D = torch.zeros_like(values_E_D)
-        key_grad_E_D[top_k_indices_B_S_R] = key_grad_R_D
-        value_grad_E_D[top_k_indices_B_S_R] = value_grad_R_D
+        top_k_keys_B_S_R_D.grad = key_grad_B_S_R_D
+        top_k_values_B_S_R_D.grad = value_grad_B_S_R_D
 
-        # return query_grad_B_S_D, key_grad_R_D, value_grad_R_D
-        return query_grad_B_S_D, key_grad_E_D, value_grad_E_D
+        return query_grad_B_S_D, None
 
 
 def test():
@@ -159,3 +147,7 @@ def test():
     assert torch.allclose(with_fn_query_grad, gt_query_grad)
     assert torch.allclose(with_fn_key_grad, gt_key_grad)
     assert torch.allclose(with_fn_value_grad, gt_value_grad)
+
+
+if __name__ == "__main__":
+    test()
