@@ -52,12 +52,19 @@ class SparseMLP(nn.Module):
         )
         t1 = time.time()  # noqa: F841
 
+        indices_B_R = torch.as_tensor(
+            indices_B_R, device=x_B_D.device, dtype=torch.long
+        )
+
         # Recompute distances
         retrieved_keys_B_R_D = self.in_weight.weight[indices_B_R]
         retrieved_values_B_R_D = self.out_weight[indices_B_R]
 
         # Compute retrieval coefficients
-        retrieval_coefficients_B_R = x_B_D @ retrieved_keys_B_R_D.transpose(1, 2)
+        retrieval_coefficients_B_R = torch.bmm(
+            x_B_D.unsqueeze(1), retrieved_keys_B_R_D.transpose(1, 2)
+        ).squeeze(1)
+
         retrievals_B_D = torch.einsum(
             "br,brd->bd", F.gelu(retrieval_coefficients_B_R), retrieved_values_B_R_D
         )
@@ -76,8 +83,31 @@ if __name__ == "__main__":
         output_dim=RESIDUAL_STREAM_DIM,
         sparsity_dim=SPARSITY_DIM,
     )
-    input = torch.randn(128, RESIDUAL_STREAM_DIM)
 
+    # Time how long it takes to build the index.
+    t0 = time.time()
     sparse_mlp.rebuild_index()
+    t1 = time.time()
+    print("Building index:", t1 - t0)
+
+    # Time how long it takes to do a forward pass.
+    # First pass to warm up.
+    input = torch.randn(128, RESIDUAL_STREAM_DIM)
     output = sparse_mlp(input)
-    print(output.shape)
+
+    t0 = time.time()
+    input = torch.randn(128, RESIDUAL_STREAM_DIM)
+    output = sparse_mlp(input)
+    t1 = time.time()
+    print("Sparse forward pass:", t1 - t0)
+
+    # Time how long the non-sparse version takes.
+    # First pass to warm up.
+    input = torch.randn(128, RESIDUAL_STREAM_DIM)
+    sparse_mlp.in_weight(input) @ sparse_mlp.out_weight
+
+    t0 = time.time()
+    input = torch.randn(128, RESIDUAL_STREAM_DIM)
+    sparse_mlp.in_weight(input) @ sparse_mlp.out_weight
+    t1 = time.time()
+    print("Dense forward pass:", t1 - t0)
